@@ -10,8 +10,8 @@ type Message = { id: number; role: Role; text: string };
 const BOT_INTRO =
   "Bonjour, je suis Sophie, votre conseillère bancaire IA. Je peux vous aider sur vos comptes, crédits, épargne et démarches.";
 
-const AVATAR_TIMESLICE_MS = 300;
-const AVATAR_SILENCE_MS = 900;
+const AVATAR_TIMESLICE_MS = 200;
+const AVATAR_SILENCE_MS = 350;
 
 function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
