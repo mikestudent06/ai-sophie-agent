@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import "./App.css";
-import { useDidAvatarStream } from "./hooks/useDidAvatarStream";
+import { useSimliAvatarStream } from "./hooks/useSimliAvatarStream";
 
 type Screen = "login" | "chat" | "avatar";
 type Role = "user" | "bot";
@@ -111,7 +111,7 @@ function App() {
     };
   }, [screen, userId, appendBot]);
 
-  const didStream = useDidAvatarStream();
+  const avatarStream = useSimliAvatarStream();
 
   useEffect(() => {
     if (screen !== "avatar") {
@@ -122,9 +122,9 @@ function App() {
       avatarVoiceWsRef.current?.close();
       avatarVoiceWsRef.current = null;
       avatarRecRef.current?.stop();
-      void didStream.destroy();
+      void avatarStream.destroy();
     }
-  }, [screen, didStream.destroy]);
+  }, [screen, avatarStream.destroy]);
 
   const submitLogin = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -168,16 +168,13 @@ function App() {
       appendBot("Micro non supporté.");
       return;
     }
-    if (!didStream.streamId || !didStream.sessionId || !didStream.streamReady || avatarVoiceBusy)
-      return;
+    if (!avatarStream.streamReady || avatarVoiceBusy) return;
     try {
-      await didStream.interruptSpeaking();
+      await avatarStream.interruptSpeaking();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
       const q = new URLSearchParams({
         user_id: userId,
-        stream_id: didStream.streamId!,
-        session_id: didStream.sessionId!,
       });
       const ws = new WebSocket(`${proto}//${window.location.host}/ws/avatar/voice?${q}`);
       avatarVoiceWsRef.current = ws;
@@ -185,7 +182,7 @@ function App() {
 
       ws.onclose = () => {
         setAvatarVoiceBusy(false);
-        didStream.restoreOutput();
+        avatarStream.restoreOutput();
         if (avatarVoiceWsRef.current === ws) {
           avatarVoiceWsRef.current = null;
         }
@@ -203,32 +200,34 @@ function App() {
         } catch {
           return;
         }
-        if (data.type === "pong" || data.type === "started") return;
+        if (data.type === "pong") return;
         if (data.type === "error") {
           if (data.detail !== "buffer vide") {
             appendBot("Erreur vocal avatar: " + (data.detail ?? "inconnue"));
           }
-          didStream.restoreOutput();
+          avatarStream.restoreOutput();
           setAvatarVoiceBusy(false);
           return;
         }
         if (data.type === "reply") {
           const said = data.user_said ?? "";
           const bot = data.sophie_text ?? "";
+          const pcm = (data as { pcm_base64?: string }).pcm_base64;
           setMessages((prev) => [
             ...prev,
             { id: Date.now(), role: "user", text: "Vous: " + said },
             { id: Date.now() + 1, role: "bot", text: bot },
           ]);
-          void didStream.unlockAudio();
-          didStream.restoreOutput();
+          if (pcm) avatarStream.playPcmBase64(pcm);
+          void avatarStream.unlockAudio();
+          avatarStream.restoreOutput();
           setAvatarVoiceBusy(false);
         }
       };
 
       ws.onerror = () => {
         appendBot("WebSocket vocal indisponible.");
-        didStream.restoreOutput();
+        avatarStream.restoreOutput();
         setAvatarVoiceBusy(false);
       };
 
@@ -278,12 +277,11 @@ function App() {
         avatarRecRef.current = null;
       });
 
-      ws.send(JSON.stringify({ type: "start" }));
       recorder.start(AVATAR_TIMESLICE_MS);
       setIsAvatarRecording(true);
     } catch {
       appendBot("Micro refusé ou connexion vocal impossible.");
-      didStream.restoreOutput();
+      avatarStream.restoreOutput();
       setAvatarVoiceBusy(false);
     }
   };
@@ -298,29 +296,32 @@ function App() {
 
   const sendAvatarTurn = async () => {
     const msg = avatarDraft.trim();
-    if (!msg || !didStream.streamId || !didStream.sessionId || !didStream.streamReady || avatarSending) return;
+    if (!msg || !avatarStream.streamReady || avatarSending) return;
     setAvatarSending(true);
     setAvatarDraft("");
     setMessages((prev) => [...prev, { id: Date.now(), role: "user", text: msg }]);
     try {
-      await didStream.interruptSpeaking();
+      await avatarStream.interruptSpeaking();
       const q = new URLSearchParams({
         user_id: userId,
         message: msg,
-        stream_id: didStream.streamId,
-        session_id: didStream.sessionId,
       });
       const res = await fetch("/api/avatar/stream/turn?" + q.toString(), { method: "POST" });
-      const j = (await res.json()) as { sophie_text?: string; detail?: unknown };
+      const j = (await res.json()) as {
+        sophie_text?: string;
+        pcm_base64?: string;
+        detail?: unknown;
+      };
       if (!res.ok) throw new Error(String(j.detail ?? res.statusText));
       const botText = j.sophie_text;
       if (botText) {
         setMessages((prev) => [...prev, { id: Date.now() + 1, role: "bot", text: botText }]);
       }
+      if (j.pcm_base64) avatarStream.playPcmBase64(j.pcm_base64);
     } catch (e) {
       appendBot("Erreur avatar: " + (e instanceof Error ? e.message : "inconnue"));
     } finally {
-      didStream.restoreOutput();
+      avatarStream.restoreOutput();
       setAvatarSending(false);
     }
   };
@@ -588,7 +589,7 @@ function App() {
         <section className="screen avatar-screen">
           <header className="avatar-head">
             <div>
-              <strong>Sophie Avatar - streaming D-ID</strong>
+              <strong>Sophie Avatar — Simli (temps réel)</strong>
               <p className="subtitle">
                 WebRTC temps réel. Connectez le stream, attendez « ready », puis envoyez une question (même historique que le chat).
               </p>
@@ -599,9 +600,9 @@ function App() {
           </header>
 
           <div className="avatar-stage">
-            <div className={"avatar-orb " + (didStream.streamReady ? "live" : "")}>
-              <video ref={didStream.videoRef} className="avatar-video" playsInline autoPlay />
-              {!didStream.streamId && (
+            <div className={"avatar-orb " + (avatarStream.streamReady ? "live" : "")}>
+              <video ref={avatarStream.videoRef} className="avatar-video" playsInline autoPlay />
+              {!avatarStream.streamReady && (
                 <div className="avatar-placeholder">
                   <h3>Sophie</h3>
                   <p>Connectez le flux vidéo pour afficher l avatar.</p>
@@ -610,17 +611,17 @@ function App() {
             </div>
           </div>
 
-          {didStream.error && <p className="error">{didStream.error}</p>}
-            {didStream.needsSoundTap && (
+          {avatarStream.error && <p className="error">{avatarStream.error}</p>}
+            {avatarStream.needsSoundTap && (
               <p className="subtitle">
-                <button type="button" className="primary-btn" onClick={() => didStream.unlockAudio()}>
+                <button type="button" className="primary-btn" onClick={() => avatarStream.unlockAudio()}>
                   Activer le son (navigateur)
                 </button>
               </p>
             )}
           <p className="subtitle avatar-status">
-            Flux: {didStream.status}
-            {didStream.streamReady ? " · prêt pour les répliques" : ""}
+            Flux Simli: {avatarStream.status}
+            {avatarStream.streamReady ? " · prêt pour les répliques" : ""}
           </p>
 
           <footer className="avatar-panel avatar-panel-stack">
@@ -628,12 +629,14 @@ function App() {
               <button
                 type="button"
                 className="primary-btn"
-                onClick={() => void didStream.connect()}
-                disabled={didStream.status === "creating" || didStream.status === "webrtc"}
+                onClick={() => void avatarStream.connect()}
+                disabled={
+                  avatarStream.status === "creating" || avatarStream.status === "webrtc"
+                }
               >
-                {didStream.streamId ? "Reconnecter" : "Connecter le stream"}
+                {avatarStream.streamReady ? "Reconnecter" : "Connecter l’avatar"}
               </button>
-              <button type="button" className="secondary-btn" onClick={() => void didStream.destroy()}>
+              <button type="button" className="secondary-btn" onClick={() => void avatarStream.destroy()}>
                 Déconnecter
               </button>
             </div>
@@ -648,7 +651,7 @@ function App() {
                 type="button"
                 className={`round-btn ${isAvatarRecording ? "recording" : ""}`}
                 onClick={toggleAvatarRecording}
-                disabled={!didStream.streamReady || (avatarVoiceBusy && !isAvatarRecording)}
+                disabled={!avatarStream.streamReady || (avatarVoiceBusy && !isAvatarRecording)}
                 title={isAvatarRecording ? "Arrêter" : "Parler à Sophie"}
               >
                 {isAvatarRecording ? "■" : "🎤"}
@@ -657,14 +660,14 @@ function App() {
                 value={avatarDraft}
                 onChange={(e) => setAvatarDraft(e.target.value)}
                 placeholder={
-                  didStream.streamReady ? "Écrire ou utiliser le micro…" : "Attente connexion stream…"
+                  avatarStream.streamReady ? "Écrire ou utiliser le micro…" : "Attente connexion stream…"
                 }
-                disabled={!didStream.streamReady || avatarSending}
+                disabled={!avatarStream.streamReady || avatarSending}
               />
               <button
                 type="submit"
                 className="primary-btn"
-                disabled={!didStream.streamReady || avatarSending || !avatarDraft.trim()}
+                disabled={!avatarStream.streamReady || avatarSending || !avatarDraft.trim()}
               >
                 {avatarSending ? "…" : "Envoyer"}
               </button>

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import uuid
@@ -16,8 +17,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from brain import sophie_brain
 from video_service import fetch_heygen_avatars, fetch_heygen_voices, generate_sophie_video
-from voice_service import generate_speech, transcribe_audio
+from voice_service import generate_speech, transcribe_audio, text_to_pcm16_mono_16k
 import stream_service
+import simli_service
 
 app = FastAPI(title="Sophie AI - Financial Advisor")
 
@@ -39,15 +41,43 @@ app.add_middleware(
 
 chat_histories: dict[str, list] = {}
 
+log = logging.getLogger("uvicorn.error")
+
+
+def coerce_agent_output(out: Any) -> str:
+    """Normalise la sortie AgentExecutor / messages LangChain en texte UTF-8 pour TTS et JSON."""
+    if out is None:
+        return ""
+    if isinstance(out, str):
+        return out.strip()
+    content = getattr(out, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                t = block.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+                elif isinstance(block.get("content"), str):
+                    parts.append(block["content"])
+            else:
+                t = getattr(block, "text", None)
+                if isinstance(t, str):
+                    parts.append(t)
+        return "".join(parts).strip()
+    return str(out).strip()
+
 
 def safe_user_id(user_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]", "_", user_id)[:120] or "user"
 
 
-async def avatar_voice_pipeline(
-    user_id: str, stream_id: str, session_id: str, audio_bytes: bytes
-) -> dict[str, Any]:
-    """Transcription → Sophie → D-ID speak_stream."""
+async def avatar_voice_pipeline(user_id: str, audio_bytes: bytes) -> dict[str, Any]:
+    """Transcription → Sophie → PCM 16 kHz pour Simli."""
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Audio vide")
     safe = safe_user_id(user_id)
@@ -61,12 +91,25 @@ async def avatar_voice_pipeline(
     if not (user_text or "").strip():
         raise HTTPException(status_code=400, detail="Transcription vide")
     sophie_text = await asyncio.to_thread(run_sophie_turn, user_id, user_text.strip())
-    status, data = await asyncio.to_thread(
-        stream_service.speak_stream, stream_id, session_id, sophie_text
-    )
-    if status >= 400:
-        raise HTTPException(status_code=status, detail=data)
-    return {"user_said": user_text, "sophie_text": sophie_text, "stream": data}
+    if not isinstance(sophie_text, str):
+        sophie_text = str(sophie_text or "")
+    if not sophie_text.strip():
+        raise HTTPException(status_code=500, detail="Réponse Sophie vide, impossible de synthétiser la voix.")
+    try:
+        pcm = await text_to_pcm16_mono_16k(sophie_text)
+    except RuntimeError as e:
+        msg = str(e).strip() or repr(e.args) or type(e).__name__
+        raise HTTPException(status_code=500, detail=msg) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"TTS/PCM: {type(e).__name__}: {e!s}",
+        ) from e
+    return {
+        "user_said": user_text,
+        "sophie_text": sophie_text,
+        "pcm_base64": base64.b64encode(pcm).decode("ascii"),
+    }
 
 
 def run_sophie_turn(user_id: str, message: str) -> str:
@@ -79,9 +122,10 @@ def run_sophie_turn(user_id: str, message: str) -> str:
         "chat_history": chat_histories[user_id],
     }
     resultat = sophie_brain.invoke(input_data)
-    out = resultat["output"]
+    raw_out = resultat.get("output")
+    out = coerce_agent_output(raw_out)
     chat_histories[user_id].extend(
-        [HumanMessage(content=turn_human), AIMessage(content=out)]
+        [HumanMessage(content=turn_human), AIMessage(content=out or " ")]
     )
     return out
 
@@ -171,18 +215,13 @@ async def chat_socket(ws: WebSocket):
 async def avatar_voice_socket(ws: WebSocket):
     """
     Chunks audio (base64) + flush pour transcription quasi temps réel.
-    Query: user_id, stream_id, session_id
-    Messages JSON: {type:'start'}, {type:'chunk', data: base64}, {type:'flush'|'end'}, {type:'ping'}
+    Query: user_id — réponse avec pcm_base64 pour lecture côté Simli.
     """
     await ws.accept()
     q = ws.query_params
     user_id = (q.get("user_id") or "").strip()
-    stream_id = (q.get("stream_id") or "").strip()
-    session_id = (q.get("session_id") or "").strip()
-    if not user_id or not stream_id or not session_id:
-        await ws.send_json(
-            {"type": "error", "detail": "user_id, stream_id et session_id requis (query)"}
-        )
+    if not user_id:
+        await ws.send_json({"type": "error", "detail": "user_id requis (query)"})
         await ws.close(code=4000)
         return
 
@@ -201,13 +240,6 @@ async def avatar_voice_socket(ws: WebSocket):
                 await ws.send_json({"type": "pong"})
                 continue
 
-            if msg_type == "start":
-                await asyncio.to_thread(
-                    stream_service.interrupt_stream, stream_id, session_id
-                )
-                await ws.send_json({"type": "started"})
-                continue
-
             if msg_type == "chunk":
                 b64 = payload.get("data") or ""
                 try:
@@ -221,9 +253,7 @@ async def avatar_voice_socket(ws: WebSocket):
                     audio_bytes = bytes(buffer)
                     buffer.clear()
                     try:
-                        result = await avatar_voice_pipeline(
-                            user_id, stream_id, session_id, audio_bytes
-                        )
+                        result = await avatar_voice_pipeline(user_id, audio_bytes)
                     except HTTPException as e:
                         detail = e.detail
                         await ws.send_json(
@@ -409,30 +439,49 @@ async def streaming_delete(stream_id: str, body: DeleteStreamBody):
     return data
 
 
+@app.post("/simli/session")
+async def simli_session():
+    """Token + ICE Simli (clé API reste côté serveur)."""
+    try:
+        data = await asyncio.to_thread(simli_service.get_session_bundle)
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return data
+
+
 @app.post("/avatar/stream/turn")
-async def avatar_stream_turn(
-    user_id: str,
-    message: str,
-    stream_id: str,
-    session_id: str,
-):
+async def avatar_stream_turn(user_id: str, message: str):
     if not message.strip():
         raise HTTPException(status_code=400, detail="message vide")
-    sophie_text = await asyncio.to_thread(run_sophie_turn, user_id, message.strip())
-    status, data = await asyncio.to_thread(
-        stream_service.speak_stream, stream_id, session_id, sophie_text
-    )
-    _did_ok(status, data)
-    return {"sophie_text": sophie_text, "stream": data}
+    try:
+        sophie_text = await asyncio.to_thread(run_sophie_turn, user_id, message.strip())
+        sophie_text = coerce_agent_output(sophie_text)
+        if not sophie_text.strip():
+            raise HTTPException(
+                status_code=500,
+                detail="Réponse Sophie vide, impossible de synthétiser la voix.",
+            )
+        pcm = await text_to_pcm16_mono_16k(sophie_text)
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        msg = str(e).strip() or repr(e.args) or type(e).__name__
+        raise HTTPException(status_code=500, detail=msg) from e
+    except Exception as e:
+        log.exception("avatar/stream/turn")
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(e).__name__}: {e!s}",
+        ) from e
+    return {
+        "sophie_text": sophie_text,
+        "pcm_base64": base64.b64encode(pcm).decode("ascii"),
+    }
+
 
 @app.post("/avatar/stream/voice")
-async def avatar_stream_voice(
-    user_id: str,
-    stream_id: str,
-    session_id: str,
-    file: UploadFile = File(...),
-):
-    """Vocal: transcription -> Sophie -> stream D-ID (fichier complet)."""
+async def avatar_stream_voice(user_id: str, file: UploadFile = File(...)):
+    """Vocal: transcription → Sophie → PCM pour Simli."""
     audio_bytes = await file.read()
-    return await avatar_voice_pipeline(user_id, stream_id, session_id, audio_bytes)
+    return await avatar_voice_pipeline(user_id, audio_bytes)
 
