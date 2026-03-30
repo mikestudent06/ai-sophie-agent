@@ -10,3 +10,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .Python
+
+# Generated TTS
+generated_audio/
+*.mp3
+

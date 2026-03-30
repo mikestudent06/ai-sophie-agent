@@ -1,22 +1,91 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from brain import sophie_brain # On importe le cerveau qu'on vient de tester
-import shutil # Pour manipuler les fichiers
-from fastapi import UploadFile, File # Pour recevoir des fichiers audio
-from voice_service import transcribe_audio, generate_speech # Nos outils de voix
+import asyncio
+import base64
+import json
 import os
-from video_service import generate_sophie_video, fetch_heygen_avatars, fetch_heygen_voices
+import re
+import uuid
+import shutil
+from pathlib import Path
+from typing import Any
 
-# 1. Créer l'application FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+from langchain_core.messages import AIMessage, HumanMessage
+
+from brain import sophie_brain
+from video_service import fetch_heygen_avatars, fetch_heygen_voices, generate_sophie_video
+from voice_service import generate_speech, transcribe_audio
+import stream_service
+
 app = FastAPI(title="Sophie AI - Financial Advisor")
 
-# --- NOUVEAU : La mémoire de Sophie ---
-# On crée un dictionnaire pour stocker l'historique des discussions
-# Structure : {"user_1": [historique], "user_2": [historique]}
-chat_histories = {}
+AUDIO_DIR = Path(__file__).resolve().parent / "generated_audio"
+AUDIO_DIR.mkdir(exist_ok=True)
 
-# 2. Définir le format de la question que le client doit envoyer (Schéma Pro)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+chat_histories: dict[str, list] = {}
+
+
+def safe_user_id(user_id: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]", "_", user_id)[:120] or "user"
+
+
+async def avatar_voice_pipeline(
+    user_id: str, stream_id: str, session_id: str, audio_bytes: bytes
+) -> dict[str, Any]:
+    """Transcription → Sophie → D-ID speak_stream."""
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Audio vide")
+    safe = safe_user_id(user_id)
+    temp_audio = AUDIO_DIR / f"temp_av_{safe}_{uuid.uuid4().hex[:12]}.webm"
+    temp_audio.write_bytes(audio_bytes)
+    try:
+        user_text = await asyncio.to_thread(transcribe_audio, str(temp_audio))
+    finally:
+        if temp_audio.is_file():
+            os.remove(temp_audio)
+    if not (user_text or "").strip():
+        raise HTTPException(status_code=400, detail="Transcription vide")
+    sophie_text = await asyncio.to_thread(run_sophie_turn, user_id, user_text.strip())
+    status, data = await asyncio.to_thread(
+        stream_service.speak_stream, stream_id, session_id, sophie_text
+    )
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=data)
+    return {"user_said": user_text, "sophie_text": sophie_text, "stream": data}
+
+
+def run_sophie_turn(user_id: str, message: str) -> str:
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
+
+    turn_human = f"Utilisateur {user_id} : {message}"
+    input_data = {
+        "input": turn_human,
+        "chat_history": chat_histories[user_id],
+    }
+    resultat = sophie_brain.invoke(input_data)
+    out = resultat["output"]
+    chat_histories[user_id].extend(
+        [HumanMessage(content=turn_human), AIMessage(content=out)]
+    )
+    return out
+
+
 class ChatRequest(BaseModel):
     user_id: str
     message: str
@@ -24,10 +93,6 @@ class ChatRequest(BaseModel):
 
 @app.get("/heygen/avatars")
 async def heygen_list_avatars():
-    """
-    Proxy vers l'API HeyGen `GET https://api.heygen.com/v2/avatars` avec ta clé `.env`.
-    À tester comme Postman : `GET http://127.0.0.1:8000/heygen/avatars`
-    """
     try:
         r = fetch_heygen_avatars()
     except ValueError as e:
@@ -41,10 +106,6 @@ async def heygen_list_avatars():
 
 @app.get("/heygen/voices")
 async def heygen_list_voices():
-    """
-    Proxy vers `GET https://api.heygen.com/v2/voices` — cherche un `voice_id` (ex. français) puis
-    `HEYGEN_VOICE_ID=...` dans `.env` si le défaut ne convient pas.
-    """
     try:
         r = fetch_heygen_voices()
     except ValueError as e:
@@ -56,100 +117,322 @@ async def heygen_list_voices():
     return JSONResponse(status_code=r.status_code, content=body)
 
 
-# 3. Créer la "Route" (l'URL) pour parler à Sophie
 @app.post("/ask")
 async def ask_sophie(request: ChatRequest):
+    sophie_answer = await asyncio.to_thread(
+        run_sophie_turn, request.user_id, request.message
+    )
+    return {"status": "success", "sophie_answer": sophie_answer}
+
+
+@app.websocket("/ws/chat")
+async def chat_socket(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "detail": "JSON invalide"})
+                continue
+
+            msg_type = payload.get("type")
+            if msg_type == "ping":
+                await ws.send_json({"type": "pong"})
+                continue
+
+            if msg_type != "chat":
+                await ws.send_json(
+                    {"type": "error", "detail": "Type inconnu (attendu: chat ou ping)"}
+                )
+                continue
+
+            user_id = payload.get("user_id") or ""
+            message = (payload.get("message") or "").strip()
+            if not user_id or not message:
+                await ws.send_json(
+                    {"type": "error", "detail": "user_id et message requis"}
+                )
+                continue
+
+            try:
+                answer = await asyncio.to_thread(run_sophie_turn, user_id, message)
+            except Exception as e:
+                await ws.send_json({"type": "error", "detail": str(e)})
+                continue
+
+            await ws.send_json({"type": "reply", "text": answer})
+    except WebSocketDisconnect:
+        return
+
+
+@app.websocket("/ws/avatar/voice")
+async def avatar_voice_socket(ws: WebSocket):
     """
-    Endpoint pour envoyer un message à Sophie.
-    Format attendu : {"user_id": "user_1", "message": "Quel est mon solde ?"}
+    Chunks audio (base64) + flush pour transcription quasi temps réel.
+    Query: user_id, stream_id, session_id
+    Messages JSON: {type:'start'}, {type:'chunk', data: base64}, {type:'flush'|'end'}, {type:'ping'}
     """
+    await ws.accept()
+    q = ws.query_params
+    user_id = (q.get("user_id") or "").strip()
+    stream_id = (q.get("stream_id") or "").strip()
+    session_id = (q.get("session_id") or "").strip()
+    if not user_id or not stream_id or not session_id:
+        await ws.send_json(
+            {"type": "error", "detail": "user_id, stream_id et session_id requis (query)"}
+        )
+        await ws.close(code=4000)
+        return
 
-    # 1. On récupère l'historique de cet utilisateur (ou on crée un vide)
-    if request.user_id not in chat_histories:
-        chat_histories[request.user_id] = []
+    buffer = bytearray()
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "detail": "JSON invalide"})
+                continue
+
+            msg_type = payload.get("type")
+            if msg_type == "ping":
+                await ws.send_json({"type": "pong"})
+                continue
+
+            if msg_type == "start":
+                await asyncio.to_thread(
+                    stream_service.interrupt_stream, stream_id, session_id
+                )
+                await ws.send_json({"type": "started"})
+                continue
+
+            if msg_type == "chunk":
+                b64 = payload.get("data") or ""
+                try:
+                    buffer.extend(base64.b64decode(b64))
+                except Exception:
+                    await ws.send_json({"type": "error", "detail": "chunk base64 invalide"})
+                continue
+
+            if msg_type in ("flush", "end"):
+                if buffer:
+                    audio_bytes = bytes(buffer)
+                    buffer.clear()
+                    try:
+                        result = await avatar_voice_pipeline(
+                            user_id, stream_id, session_id, audio_bytes
+                        )
+                    except HTTPException as e:
+                        detail = e.detail
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "detail": detail if isinstance(detail, str) else str(detail),
+                            }
+                        )
+                    else:
+                        await ws.send_json({"type": "reply", **result})
+                elif msg_type == "flush":
+                    await ws.send_json({"type": "error", "detail": "buffer vide"})
+                if msg_type == "end":
+                    break
+                continue
+
+            await ws.send_json({"type": "error", "detail": "type inconnu"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
+@app.get("/media/audio/{filename}")
+async def serve_generated_audio(filename: str):
+    if not re.match(r"^response_[a-zA-Z0-9._-]+\.mp3$", filename):
+        raise HTTPException(status_code=404, detail="Fichier non autorisé")
+    path = AUDIO_DIR / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Audio introuvable")
+    return FileResponse(path, media_type="audio/mpeg", filename=filename)
 
-    # 2. On prépare l'entrée pour l'IA avec le contexte
-    # On lui donne l'ID et l'historique actuel
-    input_data = {
-        "input": f"Utilisateur {request.user_id} : {request.message}",
-        "chat_history": chat_histories[request.user_id]
-    }
-
-    # 3. On fait réfléchir Sophie
-    resultat = sophie_brain.invoke(input_data)
-    
-    # 4. On sauvegarde l'échange dans la mémoire pour la prochaine fois
-    chat_histories[request.user_id].append({"human": request.message, "ai": resultat["output"]})
-    
-    # On renvoie la réponse au format JSON
-    return {
-        "status": "success",
-        "sophie_answer": resultat["output"]
-    }
 
 @app.post("/ask-voice")
 async def ask_sophie_voice(user_id: str, file: UploadFile = File(...)):
-    """
-    Reçoit un fichier audio, fait réfléchir Sophie, et génère une réponse vocale.
-    """
-    # 1. Sauvegarder temporairement le fichier audio envoyé par l'utilisateur
-    temp_audio_name = f"temp_{user_id}.wav"
-    with open(temp_audio_name, "wb") as buffer:
+    safe = safe_user_id(user_id)
+    suffix = Path(file.filename or "upload").suffix.lower()
+    if suffix not in (".webm", ".wav", ".mp3", ".m4a", ".ogg", ""):
+        suffix = ".webm"
+    temp_audio = AUDIO_DIR / f"temp_{safe}{suffix or '.webm'}"
+
+    with open(temp_audio, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # 2. ÉTAPE STT : Transformer l'audio en texte via Groq
-    user_text = transcribe_audio(temp_audio_name)
-    print(f"L'utilisateur a dit : {user_text}")
+    try:
+        user_text = transcribe_audio(str(temp_audio))
+    finally:
+        if temp_audio.is_file():
+            os.remove(temp_audio)
 
-    # 3. ÉTAPE BRAIN : Faire réfléchir Sophie (on réutilise notre logique précédente)
-    if user_id not in chat_histories:
-        chat_histories[user_id] = []
-    
-    input_data = {
-        "input": f"Utilisateur {user_id} : {user_text}",
-        "chat_history": chat_histories[user_id]
-    }
-    
-    resultat = sophie_brain.invoke(input_data)
-    sophie_text = resultat["output"]
+    sophie_text = await asyncio.to_thread(run_sophie_turn, user_id, user_text)
 
-    # 4. ÉTAPE TTS : Faire parler Sophie (on génère le MP3)
-    output_audio_path = f"response_{user_id}.mp3"
-    await generate_speech(sophie_text, output_audio_path)
+    out_name = f"response_{safe}.mp3"
+    output_audio_path = AUDIO_DIR / out_name
+    await generate_speech(sophie_text, str(output_audio_path))
 
-    # 5. On nettoie le fichier temporaire de l'utilisateur
-    os.remove(temp_audio_name)
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    audio_path = f"/media/audio/{out_name}"
+    audio_url = f"{base}{audio_path}" if base else audio_path
 
-    # On renvoie le texte et le nom du fichier audio généré
     return {
         "user_said": user_text,
         "sophie_answered": sophie_text,
-        "audio_url": output_audio_path
+        "audio_url": audio_url,
     }
+
 
 @app.post("/ask-full-avatar")
 async def ask_sophie_avatar(user_id: str, message: str):
-    """
-    Sophie répond avec une vidéo d'avatar !
-    """
-    # 1. Réflexion de l'IA (Brain)
     if user_id not in chat_histories:
         chat_histories[user_id] = []
-        
-    res = sophie_brain.invoke({"input": message, "chat_history": chat_histories[user_id]})
+
+    res = await asyncio.to_thread(
+        lambda: sophie_brain.invoke(
+            {"input": message, "chat_history": chat_histories[user_id]}
+        )
+    )
     sophie_text = res["output"]
-    
-    # 2. Génération de la vidéo (HeyGen)
-    # C'est cette ligne qui fait le "POST" magique
-    video_url = await generate_sophie_video(sophie_text) # <--- Ajoute 'await'
-    
-    # 3. Sauvegarde historique
-    chat_histories[user_id].append({"human": message, "ai": sophie_text})
-    
-    return {
-        "sophie_text": sophie_text,
-        "video_url": video_url # Tu recevras un lien vers la vidéo MP4 !
-    }
-# Pour lancer : uvicorn main:app --reload
+
+    video_url = await generate_sophie_video(sophie_text)
+
+    chat_histories[user_id].extend(
+        [HumanMessage(content=message), AIMessage(content=sophie_text)]
+    )
+
+    return {"sophie_text": sophie_text, "video_url": video_url}
+
+# --- D-ID streaming (WebRTC) : proxy vers api.d-id.com ---
+class SdpAnswerBody(BaseModel):
+    session_id: str
+    answer: dict[str, Any]
+
+
+class IceBody(BaseModel):
+    session_id: str
+    candidate: Any | None = None
+    sdpMid: str | None = None
+    sdpMLineIndex: int | None = None
+
+
+class SpeakStreamBody(BaseModel):
+    session_id: str
+    text: str
+
+
+class DeleteStreamBody(BaseModel):
+    session_id: str
+
+
+def _did_ok(status: int, data: dict) -> None:
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=data)
+
+
+@app.post("/streaming/create")
+async def streaming_create():
+    try:
+        status, data = await asyncio.to_thread(stream_service.create_stream)
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    _did_ok(status, data)
+    return data
+
+
+@app.post("/streaming/{stream_id}/sdp")
+async def streaming_sdp(stream_id: str, body: SdpAnswerBody):
+    status, data = await asyncio.to_thread(
+        stream_service.post_sdp, stream_id, body.answer, body.session_id
+    )
+    _did_ok(status, data)
+    return data
+
+
+@app.post("/streaming/{stream_id}/ice")
+async def streaming_ice(stream_id: str, body: IceBody):
+    status, data = await asyncio.to_thread(
+        stream_service.post_ice,
+        stream_id,
+        body.session_id,
+        body.candidate,
+        body.sdpMid,
+        body.sdpMLineIndex,
+    )
+    _did_ok(status, data)
+    return data
+
+
+
+
+@app.post("/streaming/{stream_id}/interrupt")
+async def streaming_interrupt(stream_id: str, body: DeleteStreamBody):
+    """Interrompt la synthèse vocale en cours (best-effort, compatible barge-in)."""
+    status, data = await asyncio.to_thread(
+        stream_service.interrupt_stream, stream_id, body.session_id
+    )
+    if status == 404:
+        return {"ok": True, "noop": True, "detail": "upstream sans endpoint interrupt"}
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=data)
+    return {"ok": True, "upstream": data}
+
+@app.post("/streaming/{stream_id}/speak")
+async def streaming_speak(stream_id: str, body: SpeakStreamBody):
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text vide")
+    status, data = await asyncio.to_thread(
+        stream_service.speak_stream, stream_id, body.session_id, body.text.strip()
+    )
+    _did_ok(status, data)
+    return data
+
+
+@app.delete("/streaming/{stream_id}")
+async def streaming_delete(stream_id: str, body: DeleteStreamBody):
+    status, data = await asyncio.to_thread(
+        stream_service.delete_stream, stream_id, body.session_id
+    )
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=data)
+    return data
+
+
+@app.post("/avatar/stream/turn")
+async def avatar_stream_turn(
+    user_id: str,
+    message: str,
+    stream_id: str,
+    session_id: str,
+):
+    if not message.strip():
+        raise HTTPException(status_code=400, detail="message vide")
+    sophie_text = await asyncio.to_thread(run_sophie_turn, user_id, message.strip())
+    status, data = await asyncio.to_thread(
+        stream_service.speak_stream, stream_id, session_id, sophie_text
+    )
+    _did_ok(status, data)
+    return {"sophie_text": sophie_text, "stream": data}
+
+@app.post("/avatar/stream/voice")
+async def avatar_stream_voice(
+    user_id: str,
+    stream_id: str,
+    session_id: str,
+    file: UploadFile = File(...),
+):
+    """Vocal: transcription -> Sophie -> stream D-ID (fichier complet)."""
+    audio_bytes = await file.read()
+    return await avatar_voice_pipeline(user_id, stream_id, session_id, audio_bytes)
+

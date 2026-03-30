@@ -4,6 +4,8 @@ import time
 from dotenv import load_dotenv
 import asyncio
 
+from did_auth import did_authorization_value
+
 load_dotenv()
 
 # --- HeyGen : uniquement pour les routes proxy /heygen/* dans main.py ---
@@ -33,18 +35,17 @@ def fetch_heygen_voices():
 
 
 # --- D-ID : génération vidéo pour Sophie (ask-full-avatar) ---
-DID_API_KEY = os.getenv("DID_API_KEY")
 DID_URL = "https://api.d-id.com/talks"
 
 
 async def generate_sophie_video(text: str):
-    if not DID_API_KEY:
+    try:
+        headers = {
+            "Authorization": did_authorization_value(),
+            "Content-Type": "application/json",
+        }
+    except ValueError:
         return "Erreur : Clé DID_API_KEY manquante."
-
-    headers = {
-        "Authorization": f"Basic {DID_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
     data = {
         "script": {

@@ -1,0 +1,35 @@
+:root {
+  --radius: 12px;
+  --background: #f7f8fb;
+  --foreground: #1f2633;
+  --card: #ffffff;
+  --muted: #eef1f7;
+  --muted-foreground: #617089;
+  --primary: #1f2633;
+  --primary-foreground: #ffffff;
+  --accent: #6f8db3;
+  --accent-foreground: #ffffff;
+  --border: #d8deea;
+  --ring: #6f8db3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: radial-gradient(circle at 10% 10%, #ffffff 0%, var(--background) 45%, #edf1f8 100%);
+  color: var(--foreground);
+  font-family: Inter, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
