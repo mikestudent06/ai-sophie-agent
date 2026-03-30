@@ -220,8 +220,11 @@ function App() {
             { id: Date.now(), role: "user", text: "Vous: " + said },
             { id: Date.now() + 1, role: "bot", text: bot },
           ]);
+          if (bot.trim()) {
+            didStream.registerSpeechEstimate(bot);
+          }
           void didStream.unlockAudio();
-          didStream.restoreOutput();
+          window.setTimeout(() => didStream.restoreOutput(), 450);
           setAvatarVoiceBusy(false);
         }
       };
@@ -304,6 +307,7 @@ function App() {
     setMessages((prev) => [...prev, { id: Date.now(), role: "user", text: msg }]);
     try {
       await didStream.interruptSpeaking();
+      await new Promise((r) => setTimeout(r, 320));
       const q = new URLSearchParams({
         user_id: userId,
         message: msg,
@@ -316,11 +320,15 @@ function App() {
       const botText = j.sophie_text;
       if (botText) {
         setMessages((prev) => [...prev, { id: Date.now() + 1, role: "bot", text: botText }]);
+        didStream.registerSpeechEstimate(botText);
+        window.setTimeout(() => didStream.restoreOutput(), 450);
+      } else {
+        didStream.restoreOutput();
       }
     } catch (e) {
       appendBot("Erreur avatar: " + (e instanceof Error ? e.message : "inconnue"));
-    } finally {
       didStream.restoreOutput();
+    } finally {
       setAvatarSending(false);
     }
   };
@@ -600,7 +608,21 @@ function App() {
 
           <div className="avatar-stage">
             <div className={"avatar-orb " + (didStream.streamReady ? "live" : "")}>
-              <video ref={didStream.videoRef} className="avatar-video" playsInline autoPlay />
+              <video
+                ref={didStream.videoRef}
+                className="avatar-video"
+                playsInline
+                autoPlay
+                poster={didStream.idlePosterUrl ?? undefined}
+              />
+              {didStream.idlePosterUrl && didStream.streamCoverVisible && (
+                <img
+                  className="avatar-video-cover"
+                  src={didStream.idlePosterUrl}
+                  alt=""
+                  aria-hidden
+                />
+              )}
               {!didStream.streamId && (
                 <div className="avatar-placeholder">
                   <h3>Sophie</h3>
@@ -621,6 +643,7 @@ function App() {
           <p className="subtitle avatar-status">
             Flux: {didStream.status}
             {didStream.streamReady ? " · prêt pour les répliques" : ""}
+            {didStream.speechBusy ? " · lecture en cours (évitez d enchaîner trop vite)" : ""}
           </p>
 
           <footer className="avatar-panel avatar-panel-stack">

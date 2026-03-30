@@ -1,4 +1,4 @@
-﻿import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export type DidStreamStatus =
   | "idle"
@@ -55,6 +55,8 @@ type CreateStreamResponse = {
   offer: RTCSessionDescriptionInit;
   ice_servers: RTCIceServer[];
   session_id: string;
+  /** Image présentatrice tant que le flux WebRTC n’a pas encore de frame */
+  idle_poster_url?: string;
 };
 
 export function useDidAvatarStream() {
@@ -66,6 +68,8 @@ export function useDidAvatarStream() {
   const readyRef = useRef(false);
   const fallbackTimerRef = useRef<number | null>(null);
   const outputDuckedRef = useRef(false);
+  const speechBusyTimerRef = useRef<number | null>(null);
+  const warmupDoneRef = useRef(false);
 
   const [status, setStatus] = useState<DidStreamStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -73,6 +77,37 @@ export function useDidAvatarStream() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [streamReady, setStreamReady] = useState(false);
   const [needsSoundTap, setNeedsSoundTap] = useState(false);
+  const [speechBusy, setSpeechBusy] = useState(false);
+  const [idlePosterUrl, setIdlePosterUrl] = useState<string | null>(null);
+  /** Masque le spinner natif du navigateur (waiting / stalled entre frames WebRTC). */
+  const [streamCoverVisible, setStreamCoverVisible] = useState(false);
+
+  const clearSpeechBusy = useCallback(() => {
+    if (speechBusyTimerRef.current != null) {
+      window.clearTimeout(speechBusyTimerRef.current);
+      speechBusyTimerRef.current = null;
+    }
+    setSpeechBusy(false);
+  }, []);
+
+  /**
+   * Le POST /speak revient avant la fin de la lecture WebRTC. On estime une fenêtre
+   * pour éviter d enchaîner une 2e réplique pendant que la 1re joue encore (chevauchement / stitch).
+   * Réinitialisé par interruptSpeaking (coupure / nouveau tour).
+   */
+  const registerSpeechEstimate = useCallback((text: string) => {
+    clearSpeechBusy();
+    const t = (text || "").trim();
+    const ms = Math.min(
+      120_000,
+      Math.max(2500, t.length * 72),
+    );
+    setSpeechBusy(true);
+    speechBusyTimerRef.current = window.setTimeout(() => {
+      speechBusyTimerRef.current = null;
+      setSpeechBusy(false);
+    }, ms);
+  }, [clearSpeechBusy]);
 
   const unlockAudio = useCallback(() => {
     const v = videoRef.current;
@@ -109,6 +144,7 @@ export function useDidAvatarStream() {
   }, []);
 
   const interruptSpeaking = useCallback(async () => {
+    clearSpeechBusy();
     duckOutput();
     const sid = sessionIdRef.current;
     const stid = streamIdRef.current;
@@ -128,7 +164,7 @@ export function useDidAvatarStream() {
         /* ignore */
       }
     }
-  }, [duckOutput]);
+  }, [clearSpeechBusy, duckOutput]);
 
 
   const markReady = useCallback(() => {
@@ -140,9 +176,22 @@ export function useDidAvatarStream() {
     readyRef.current = true;
     setStreamReady(true);
     setStatus("ready");
+
+    const sid = sessionIdRef.current;
+    const stid = streamIdRef.current;
+    if (sid && stid && !warmupDoneRef.current) {
+      warmupDoneRef.current = true;
+      void fetchJson(apiUrl("/streaming/" + stid + "/warmup"), {
+        method: "POST",
+        body: JSON.stringify({ session_id: sid }),
+      }).catch(() => {
+        // best-effort uniquement
+      });
+    }
   }, []);
 
   const cleanupPc = useCallback(() => {
+    clearSpeechBusy();
     if (fallbackTimerRef.current != null) {
       window.clearTimeout(fallbackTimerRef.current);
       fallbackTimerRef.current = null;
@@ -165,7 +214,28 @@ export function useDidAvatarStream() {
     setSessionId(null);
     setStreamReady(false);
     setNeedsSoundTap(false);
-  }, []);
+    setIdlePosterUrl(null);
+    setStreamCoverVisible(false);
+  }, [clearSpeechBusy]);
+
+  useEffect(() => {
+    if (!streamId) return;
+    const v = videoRef.current;
+    if (!v) return;
+
+    const showCover = () => setStreamCoverVisible(true);
+    const hideCover = () => setStreamCoverVisible(false);
+
+    v.addEventListener("waiting", showCover);
+    v.addEventListener("stalled", showCover);
+    v.addEventListener("playing", hideCover);
+
+    return () => {
+      v.removeEventListener("waiting", showCover);
+      v.removeEventListener("stalled", showCover);
+      v.removeEventListener("playing", hideCover);
+    };
+  }, [streamId]);
 
   const destroy = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -195,9 +265,16 @@ export function useDidAvatarStream() {
         method: "POST",
       });
 
-      const { id: newStreamId, offer, ice_servers: iceServers, session_id: newSessionId } = created;
+      const { id: newStreamId, offer, ice_servers: iceServers, session_id: newSessionId } =
+        created;
+      setIdlePosterUrl(
+        typeof created.idle_poster_url === "string" && created.idle_poster_url.length > 0
+          ? created.idle_poster_url
+          : null,
+      );
       streamIdRef.current = newStreamId;
       sessionIdRef.current = newSessionId;
+      warmupDoneRef.current = false;
       setStreamId(newStreamId);
       setSessionId(newSessionId);
 
@@ -299,5 +376,10 @@ export function useDidAvatarStream() {
     interruptSpeaking,
     connect,
     destroy,
+    speechBusy,
+    registerSpeechEstimate,
+    clearSpeechBusy,
+    idlePosterUrl,
+    streamCoverVisible,
   };
 }

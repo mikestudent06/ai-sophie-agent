@@ -348,6 +348,8 @@ async def streaming_create():
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     _did_ok(status, data)
+    if isinstance(data, dict):
+        data = {**data, "idle_poster_url": stream_service.idle_poster_url()}
     return data
 
 
@@ -384,6 +386,14 @@ async def streaming_interrupt(stream_id: str, body: DeleteStreamBody):
     )
     if status == 404:
         return {"ok": True, "noop": True, "detail": "upstream sans endpoint interrupt"}
+    # Legacy talks/clips : la route HTTP interrupt n est pas documentée ; l amont peut répondre 403
+    # alors que create/sdp/ice fonctionnent (ce n est pas une erreur Basic Auth). Data channel reste le filet de secours.
+    if status == 403:
+        return {
+            "ok": True,
+            "noop": True,
+            "detail": "upstream interrupt refusé (403) — souvent indisponible sur streams legacy",
+        }
     if status >= 400:
         raise HTTPException(status_code=status, detail=data)
     return {"ok": True, "upstream": data}
@@ -394,6 +404,19 @@ async def streaming_speak(stream_id: str, body: SpeakStreamBody):
         raise HTTPException(status_code=400, detail="text vide")
     status, data = await asyncio.to_thread(
         stream_service.speak_stream, stream_id, body.session_id, body.text.strip()
+    )
+    _did_ok(status, data)
+    return data
+
+
+@app.post("/streaming/{stream_id}/warmup")
+async def streaming_warmup(stream_id: str, body: DeleteStreamBody):
+    """
+    Warmup vidéo : déclenche une courte réplique pour que le flux WebRTC affiche
+    l avatar avant la première question utilisateur.
+    """
+    status, data = await asyncio.to_thread(
+        stream_service.warmup_stream, stream_id, body.session_id
     )
     _did_ok(status, data)
     return data
